@@ -194,6 +194,17 @@ jobs:
             rclone copy \
               "r2:$R2_BUCKET" repo/ \
               --exclude "helium.flatpakrepo"
+
+            # Object storage does not preserve empty OSTree directories. In
+            # particular, static-delta generation requires refs/remotes.
+            mkdir -p \
+              repo/extensions \
+              repo/objects \
+              repo/refs/heads \
+              repo/refs/mirrors \
+              repo/refs/remotes \
+              repo/state \
+              repo/tmp/cache
           else
             ostree init --repo=repo --mode=archive-z2
           fi
