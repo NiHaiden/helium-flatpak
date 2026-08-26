@@ -4,23 +4,30 @@ This repository contains the [Flatpak](https://flatpak.org/) manifest for **Heli
 
 It wraps the official prebuilt binaries from the [Helium Linux project](https://github.com/imputnet/helium-linux) into a sandboxed Flatpak environment,
 ensuring it runs consistently across different Linux distributions.  
-Sandbox protection is supported via Zypak.  
-Automatic updates are available on [BlossomOS](https://blossomos.org/).
+Sandbox protection is supported via Zypak. The signed Flatpak repository provides automatic updates.
 
 ---
 
 ## Installation (Recommended)
 
-The easiest way to install Helium is using the standalone bundle. This bypasses the need for manual repositories and works on any system with Flatpak installed.
+Add the signed Helium repository and install the application:
 
-1.  **Download** the latest `.flatpak` bundle from the [**Releases Page**](https://github.com/ShyVortex/helium-flatpak/releases).
-2.  **Install** it via the command line, in the directory where you downloaded the file:
+```bash
+flatpak remote-add --if-not-exists helium https://helium-flatpak.nhaiden.io/helium.flatpakrepo
+flatpak install helium net.imput.helium
+```
 
-    ```bash
-    flatpak install ./helium-[VERSION]-[ARCH].flatpak
-    ```
+Flatpak will deliver future Helium updates from this repository.
 
-    *Note: on some distributions, you can simply double-click the downloaded file to install it via your Software Center.*
+### Standalone Bundle
+
+Standalone `.flatpak` bundles remain available from the [Releases Page](https://github.com/NiHaiden/helium-flatpak/releases). Download the bundle for your architecture and install it with:
+
+```bash
+flatpak install ./helium-[VERSION]-[ARCH].flatpak
+```
+
+On some distributions, you can also open the downloaded file in your Software Center.
 
 ---
 
@@ -52,6 +59,23 @@ flatpak-builder --arch=aarch64 --user --install --force-clean build-dir net.impu
 ```
 
 *Note: to install for all users, use sudo and replace '--user' with '--system'.*
+
+---
+
+## Repository Publishing
+
+The public Cloudflare R2 bucket endpoint is [https://helium-flatpak.nhaiden.io/](https://helium-flatpak.nhaiden.io/). The repository descriptor is available at [`helium.flatpakrepo`](https://helium-flatpak.nhaiden.io/helium.flatpakrepo).
+
+The `Helium Auto Update` workflow continues to attach standalone bundles to GitHub Releases and also publishes a signed, multi-architecture OSTree repository to Cloudflare R2. It expects these GitHub Actions secrets:
+
+- `FLATPAK_GPG_PRIVATE_KEY_B64`
+- `FLATPAK_GPG_KEY_ID`
+- `R2_ACCOUNT_ID`
+- `R2_ACCESS_KEY_ID`
+- `R2_SECRET_ACCESS_KEY`
+- `R2_BUCKET`
+
+The publish job uses the `flatpak-repository` GitHub environment. A manual workflow run rebuilds and publishes the current version without creating a duplicate GitHub Release.
 
 ---
 

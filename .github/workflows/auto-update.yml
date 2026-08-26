@@ -10,8 +10,12 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: helium-flatpak-publish
+  cancel-in-progress: false
+
 jobs:
-  # 1. Update the Manifest File
+  # 1. Update the manifest file.
   update-manifest:
     runs-on: ubuntu-latest
     outputs:
@@ -20,16 +24,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          
+
       - name: Run update script
         run: bash ./grab_latest.sh
-        
-      - name: Check and Commit
+
+      - name: Check and commit
         id: check
         run: |
           git config --global user.name "helium-bot"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
+
           if [[ -n $(git status -s net.imput.helium.yml) ]]; then
             echo "changes_detected=true" >> "$GITHUB_OUTPUT"
             VERSION=$(grep -m1 'version:' version.txt | awk '{print $2}')
@@ -40,10 +44,11 @@ jobs:
             echo "changes_detected=false" >> "$GITHUB_OUTPUT"
           fi
 
-  # 2. Build the Flatpaks
+  # 2. Build both native architectures. Manual runs also rebuild the current
+  # version, which is useful for initially publishing or repairing the repo.
   build-flatpak:
     needs: update-manifest
-    if: needs.update-manifest.outputs.changes_detected == 'true'
+    if: needs.update-manifest.outputs.changes_detected == 'true' || github.event_name == 'workflow_dispatch'
     strategy:
       matrix:
         include:
@@ -70,34 +75,51 @@ jobs:
       - name: Setup Flathub
         run: flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
-      - name: Build and Bundle
+      - name: Build repository and bundle
         run: |
           VERSION=$(grep -m1 'version:' version.txt | awk '{print $2}')
-          flatpak-builder --arch=${{ matrix.flatpak_arch }} --user --repo=repo --force-clean --install-deps-from=flathub build-dir net.imput.helium.yml
-          flatpak build-bundle --arch=${{ matrix.flatpak_arch }} repo "helium-${VERSION}-${{ matrix.file_arch }}.flatpak" net.imput.helium
+          flatpak-builder \
+            --arch=${{ matrix.flatpak_arch }} \
+            --user \
+            --repo=repo \
+            --force-clean \
+            --install-deps-from=flathub \
+            build-dir net.imput.helium.yml
+          flatpak build-bundle \
+            --arch=${{ matrix.flatpak_arch }} \
+            repo \
+            "helium-${VERSION}-${{ matrix.file_arch }}.flatpak" \
+            net.imput.helium
+          tar -C repo -cf "flatpak-repo-${{ matrix.flatpak_arch }}.tar" .
 
-      - name: Upload Artifact
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
           name: flatpak-${{ matrix.file_arch }}
-          path: "*.flatpak"
+          compression-level: 0
+          if-no-files-found: error
+          path: |
+            *.flatpak
+            flatpak-repo-*.tar
 
-  # 3. Create the Release
+  # 3. Keep standalone bundles available through GitHub Releases. A manual
+  # rebuild without a manifest update skips this to avoid duplicate releases.
   release:
     needs: [update-manifest, build-flatpak]
+    if: needs.update-manifest.outputs.changes_detected == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
           ref: main
 
-      - name: Download Artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: Create Release
+      - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -105,8 +127,7 @@ jobs:
           IS_PRERELEASE=$(grep -m1 'prerelease:' version.txt | awk '{print $2}')
           FLAGS=""
           if [[ "$IS_PRERELEASE" == "true" ]]; then FLAGS="--prerelease"; fi
-          
-          # Upload all downloaded flatpak artifacts
+
           gh release create "$VERSION" \
             artifacts/*.flatpak \
             --target main \
@@ -114,3 +135,137 @@ jobs:
             --notes "Automated update to Helium version $VERSION" \
             --generate-notes \
             $FLAGS
+
+  # 4. Merge both native repositories, sign their commits and summary, then
+  # publish the repository to Cloudflare R2. Immutable data goes up before the
+  # summary so clients never see references to objects that are not uploaded.
+  publish-repository:
+    needs: [update-manifest, build-flatpak]
+    if: needs.update-manifest.outputs.changes_detected == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: flatpak-repository
+    env:
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      RCLONE_CONFIG_R2_TYPE: s3
+      RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Download architecture repositories
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Install publishing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak ostree rclone
+
+      - name: Import signing key
+        env:
+          PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY_B64 }}
+        run: |
+          : "${PRIVATE_KEY:?FLATPAK_GPG_PRIVATE_KEY_B64 is not configured}"
+          : "${GPG_KEY_ID:?FLATPAK_GPG_KEY_ID is not configured}"
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$PRIVATE_KEY" | base64 --decode | gpg --batch --homedir "$GNUPGHOME" --import
+          gpg --batch --homedir "$GNUPGHOME" --list-secret-keys "$GPG_KEY_ID"
+
+      - name: Restore published repository
+        run: |
+          : "${R2_BUCKET:?R2_BUCKET is not configured}"
+          mkdir -p repo
+          rclone lsf "r2:$R2_BUCKET" --max-depth 1 > "$RUNNER_TEMP/r2-root.txt"
+          if grep -Fxq "config" "$RUNNER_TEMP/r2-root.txt"; then
+            rclone copy \
+              "r2:$R2_BUCKET" repo/ \
+              --exclude "helium.flatpakrepo"
+          else
+            ostree init --repo=repo --mode=archive-z2
+          fi
+
+      - name: Merge and sign architecture commits
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+
+          for ARCH in x86_64 aarch64; do
+            SOURCE_REPO="$RUNNER_TEMP/repo-$ARCH"
+            REF="app/net.imput.helium/$ARCH/master"
+            mkdir -p "$SOURCE_REPO"
+            tar -xf "artifacts/flatpak-repo-$ARCH.tar" -C "$SOURCE_REPO"
+            ostree rev-parse --repo="$SOURCE_REPO" "$REF"
+            flatpak build-commit-from \
+              --src-repo="$SOURCE_REPO" \
+              --src-ref="$REF" \
+              --update-appstream \
+              --no-summary-index \
+              --gpg-sign="$GPG_KEY_ID" \
+              --gpg-homedir="$GNUPGHOME" \
+              repo "$REF"
+          done
+
+          flatpak build-update-repo repo \
+            --title="Helium" \
+            --comment="Private, fast, and honest web browser" \
+            --homepage="https://github.com/NiHaiden/helium-flatpak" \
+            --default-branch=master \
+            --generate-static-deltas \
+            --no-summary-index \
+            --gpg-import=helium-flatpak.gpg \
+            --gpg-sign="$GPG_KEY_ID" \
+            --gpg-homedir="$GNUPGHOME"
+
+          test -s repo/summary
+          test -s repo/summary.sig
+          ostree refs --repo=repo
+
+      - name: Upload repository to R2
+        run: |
+          # Upload content-addressed objects and deltas with immutable caching.
+          # We intentionally do not delete old objects here; clients with a
+          # cached older summary may still need them.
+          rclone copy \
+            repo/objects/ "r2:$R2_BUCKET/objects/" \
+            --header-upload "Cache-Control: public,max-age=31536000,immutable"
+
+          if [[ -d repo/deltas ]]; then
+            rclone copy \
+              repo/deltas/ "r2:$R2_BUCKET/deltas/" \
+              --header-upload "Cache-Control: public,max-age=31536000,immutable"
+          fi
+
+          # Upload mutable repository metadata after every referenced object is
+          # present, but hold back the signed summary until the very end.
+          rclone copy \
+            repo/ "r2:$R2_BUCKET/" \
+            --exclude ".lock" \
+            --exclude "objects/**" \
+            --exclude "deltas/**" \
+            --exclude "summary" \
+            --exclude "summary.sig" \
+            --header-upload "Cache-Control: public,max-age=300"
+
+          # Upload the detached signature first and the summary last. A client
+          # can see a transient signature mismatch, but never a valid summary
+          # that references objects which have not finished uploading.
+          rclone copyto \
+            repo/summary.sig "r2:$R2_BUCKET/summary.sig" \
+            --header-upload "Cache-Control: no-cache" \
+            --header-upload "Content-Type: application/octet-stream"
+          rclone copyto \
+            repo/summary "r2:$R2_BUCKET/summary" \
+            --header-upload "Cache-Control: no-cache" \
+            --header-upload "Content-Type: application/octet-stream"
+          rclone copyto \
+            helium.flatpakrepo "r2:$R2_BUCKET/helium.flatpakrepo" \
+            --header-upload "Cache-Control: public,max-age=300" \
+            --header-upload "Content-Type: text/plain; charset=utf-8"
