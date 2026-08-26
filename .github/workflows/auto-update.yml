@@ -102,11 +102,12 @@ jobs:
             *.flatpak
             flatpak-repo-*.tar
 
-  # 3. Keep standalone bundles available through GitHub Releases. A manual
-  # rebuild without a manifest update skips this to avoid duplicate releases.
+  # 3. Keep standalone bundles available through GitHub Releases. This is
+  # idempotent so manual rebuilds can create a missing release or replace its
+  # assets without creating a duplicate.
   release:
     needs: [update-manifest, build-flatpak]
-    if: needs.update-manifest.outputs.changes_detected == 'true'
+    if: needs.update-manifest.outputs.changes_detected == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -125,16 +126,20 @@ jobs:
         run: |
           VERSION=$(grep -m1 'version:' version.txt | awk '{print $2}')
           IS_PRERELEASE=$(grep -m1 'prerelease:' version.txt | awk '{print $2}')
-          FLAGS=""
-          if [[ "$IS_PRERELEASE" == "true" ]]; then FLAGS="--prerelease"; fi
+          FLAGS=()
+          if [[ "$IS_PRERELEASE" == "true" ]]; then FLAGS+=(--prerelease); fi
 
-          gh release create "$VERSION" \
-            artifacts/*.flatpak \
-            --target main \
-            --title "$VERSION" \
-            --notes "Automated update to Helium version $VERSION" \
-            --generate-notes \
-            $FLAGS
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" artifacts/*.flatpak --clobber
+          else
+            gh release create "$VERSION" \
+              artifacts/*.flatpak \
+              --target main \
+              --title "$VERSION" \
+              --notes "Automated update to Helium version $VERSION" \
+              --generate-notes \
+              "${FLAGS[@]}"
+          fi
 
   # 4. Merge both native repositories, sign their commits and summary, then
   # publish the repository to Cloudflare R2. Immutable data goes up before the
@@ -230,17 +235,12 @@ jobs:
 
       - name: Upload repository to R2
         run: |
-          # Upload content-addressed objects and deltas with immutable caching.
-          # We intentionally do not delete old objects here; clients with a
-          # cached older summary may still need them.
-          rclone copy \
-            repo/objects/ "r2:$R2_BUCKET/objects/" \
-            --header-upload "Cache-Control: public,max-age=31536000,immutable"
+          # We intentionally use copy rather than sync so older objects are not
+          # deleted while clients may still have an older summary cached.
+          rclone copy repo/objects/ "r2:$R2_BUCKET/objects/"
 
           if [[ -d repo/deltas ]]; then
-            rclone copy \
-              repo/deltas/ "r2:$R2_BUCKET/deltas/" \
-              --header-upload "Cache-Control: public,max-age=31536000,immutable"
+            rclone copy repo/deltas/ "r2:$R2_BUCKET/deltas/"
           fi
 
           # Upload mutable repository metadata after every referenced object is
@@ -251,21 +251,16 @@ jobs:
             --exclude "objects/**" \
             --exclude "deltas/**" \
             --exclude "summary" \
-            --exclude "summary.sig" \
-            --header-upload "Cache-Control: public,max-age=300"
+            --exclude "summary.sig"
 
-          # Upload the detached signature first and the summary last. A client
-          # can see a transient signature mismatch, but never a valid summary
-          # that references objects which have not finished uploading.
+          # Upload the detached signature first and the summary last. Force
+          # these small pointer files to be replaced even if their sizes match.
           rclone copyto \
             repo/summary.sig "r2:$R2_BUCKET/summary.sig" \
-            --header-upload "Cache-Control: no-cache" \
-            --header-upload "Content-Type: application/octet-stream"
+            --ignore-times
           rclone copyto \
             repo/summary "r2:$R2_BUCKET/summary" \
-            --header-upload "Cache-Control: no-cache" \
-            --header-upload "Content-Type: application/octet-stream"
+            --ignore-times
           rclone copyto \
             helium.flatpakrepo "r2:$R2_BUCKET/helium.flatpakrepo" \
-            --header-upload "Cache-Control: public,max-age=300" \
-            --header-upload "Content-Type: text/plain; charset=utf-8"
+            --ignore-times
